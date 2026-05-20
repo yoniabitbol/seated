@@ -10,6 +10,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@prelude.so/js-sdk": "^0.9.0",
     "playwright": "^1.60.0"
   }
 }

@@ -17,7 +17,7 @@ const SMSPOOL_SERVICE = '810';
 const SMSPOOL_COUNTRY = '1';
 const FORM_URL = 'https://go.seated.com/event-reminders/88c8e073-5537-486a-bdb1-3733b89fd09f/info';
 let CONCURRENCY = 10;
-const USES_PER_NUMBER = 3;
+let USES_PER_NUMBER = 1;
 const TASK_TIMEOUT_MS = 600000;
 const COMPLETED_FILE = path.join(__dirname, 'completed.txt');
 
@@ -402,13 +402,16 @@ async function processGroup(emails, firstNames, lastNames, postalCodes, groupTag
   const answer = await askQuestion('How many concurrent windows? (default 10): ');
   CONCURRENCY = parseInt(answer, 10) || 10;
 
+  const reuseAnswer = await askQuestion('Reuse phone numbers? (y = reuse up to 3x, n = fresh number per email) [n]: ');
+  USES_PER_NUMBER = reuseAnswer.toLowerCase() === 'y' ? 3 : 1;
+
   const allEmails = loadLines('emails.txt').filter(l => l.includes('@'));
   const uniqueEmails = [...new Set(allEmails)];
   const completed = loadCompleted();
   const pending = uniqueEmails.filter(e => !completed.has(e));
 
   console.log(`Total: ${uniqueEmails.length} | Done: ${completed.size} | Remaining: ${pending.length}`);
-  console.log(`Concurrency: ${CONCURRENCY} groups | ${USES_PER_NUMBER} emails/number\n`);
+  console.log(`Concurrency: ${CONCURRENCY} groups | ${USES_PER_NUMBER} email${USES_PER_NUMBER > 1 ? 's' : ''}/number | US numbers only\n`);
   if (!pending.length) { console.log('All emails done!'); process.exit(0); }
 
   const groups = [];
