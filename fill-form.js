@@ -15,11 +15,34 @@ function askQuestion(query) {
 const SMSPOOL_KEY = 'FseOMNf1VXHO0y9tmOnzS61rO7BXxK8f';
 const SMSPOOL_SERVICE = '810';
 const SMSPOOL_COUNTRY = '1';
-const FORM_URL = 'https://go.seated.com/event-reminders/88c8e073-5537-486a-bdb1-3733b89fd09f/info';
+
+// 5sim provider config (https://5sim.net/v1). Auth is a JWT bearer token.
+const FIVESIM_KEY = 'eyJhbGciOiJSUzUxMiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE4MTIzNzc3NDYsImlhdCI6MTc4MDg0MTc0NiwicmF5IjoiOWQ3YzRmNzA4NDE1ZTVkNTViYzI3YmJjYmUxNzljNmMiLCJzdWIiOjQxNzg3NTd9.BF_Bqn4Xhi0vgUYNgc_xAmBYc3kUpdrt-4H0JJ45Znf35MIRANDj4T8T8jciTF-NLoIy2kCJ8XpGF-aPcYOmUfIiGdsu4l2pef9y65S2Xo_xTWqDCgOG3FfB2x9JbnGor2GBjQpthxF5tYhz6-KYPelkOgRv3sP4VsR-jjNkX6VPrZh62S4veibqg-NzMG67U6Q0jyfC-lJNvnMDnMvrA1A3EOEMRDksE44JX9qEfHdxCoTXbYxHRLPtYjvbjn0XA9JVA2fkSu--QNT7Ju6IZlyHeWWETu8WvrGgp4w_UUd_XO0UyJZkgVJfZ_YttR1TI3NadmSiejykIvbI-yGABw';
+const FIVESIM_COUNTRY = 'usa';
+const FIVESIM_OPERATOR = 'any';
+const FIVESIM_PRODUCT = 'seated';
+
+// Which SMS provider to use: 'smspool' or '5sim'. Set from the startup dialog.
+let PROVIDER = 'smspool';
+
 let CONCURRENCY = 10;
 let USES_PER_NUMBER = 1;
 const TASK_TIMEOUT_MS = 600000;
-const COMPLETED_FILE = path.join(__dirname, 'completed.txt');
+
+// ── Events: emails.txt is split sequentially across these in order.
+// First `count` emails → first event, next `count` → second event, etc.
+// Each event tracks its own progress in completed-<eventId>.txt, so reruns resume.
+const EVENTS = [
+  { name: 'Lubbock',              url: 'https://go.seated.com/event-reminders/0776364a-50c3-4839-a70c-b3557949b8f5/info', count: 167 },
+  { name: 'Morrison',              url: 'https://go.seated.com/event-reminders/69a8b2c5-8750-435a-b2d4-6674f4b10d2c/info', count: 167 },
+  { name: 'Athens',              url: 'https://go.seated.com/event-reminders/79045e33-7a38-48a3-a37e-158b325afffc/info', count: 167 },
+  { name: 'Auburn',              url: 'https://go.seated.com/event-reminders/a0ca9386-de04-4c9e-88ee-1ab7ed9e797a/info', count: 167 },
+  { name: 'State College',              url: 'https://go.seated.com/event-reminders/5e995dc3-acee-4ecc-b88f-15be6a2489a7/info', count: 167 },
+  { name: 'LA',              url: 'https://go.seated.com/event-reminders/b34b425d-37a8-4e5c-8839-969323690e21/info', count: 167 }
+];
+
+function eventId(url) { return url.match(/\/([a-f0-9-]{36})\//)?.[1] || 'default'; }
+function completedFileFor(url) { return path.join(__dirname, `completed-${eventId(url)}.txt`); }
 
 // ── Utilities ──
 
@@ -27,11 +50,11 @@ function loadLines(file) {
   return fs.readFileSync(path.join(__dirname, file), 'utf-8').split('\n').map(l => l.trim()).filter(Boolean);
 }
 function randomFrom(lines) { return lines[Math.floor(Math.random() * lines.length)]; }
-function loadCompleted() {
-  if (!fs.existsSync(COMPLETED_FILE)) return new Set();
-  return new Set(loadLines('completed.txt'));
+function loadCompleted(completedFile) {
+  if (!fs.existsSync(completedFile)) return new Set();
+  return new Set(fs.readFileSync(completedFile, 'utf-8').split('\n').map(l => l.trim()).filter(Boolean));
 }
-function markCompleted(email) { fs.appendFileSync(COMPLETED_FILE, email + '\n'); }
+function markCompleted(completedFile, email) { fs.appendFileSync(completedFile, email + '\n'); }
 function loadProxy() {
   const lines = loadLines('isp.txt');
   const raw = randomFrom(lines);
@@ -39,92 +62,102 @@ function loadProxy() {
   return { server: `http://${p[0]}:${p[1]}`, username: p[2], password: p[3] };
 }
 
+// Retry config (kept out of the protected constants block above).
+const MAX_ATTEMPTS = 3;            // attempts per email before giving up
+const ATTEMPT_TIMEOUT_MS = 300000; // 5 min cap per attempt (browser is killed on timeout)
+
+// Run `promise` but reject if it doesn't settle within `ms`. The caller is
+// responsible for cleanup (killing the browser) so a hung step never leaks.
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 // ── SMSPool API (all calls wrapped with retry + timeout) ──
 
-async function fetchWithTimeout(url, timeoutMs = 15000) {
+async function fetchWithTimeout(url, timeoutMs = 15000, headers = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { signal: controller.signal });
+    const res = await fetch(url, { signal: controller.signal, headers });
     return await res.json();
   } finally {
     clearTimeout(timer);
   }
 }
 
+function fivesimHeaders() {
+  return { Authorization: `Bearer ${FIVESIM_KEY}`, Accept: 'application/json' };
+}
+
 async function orderSmsNumber(tag, retries = 3) {
-  const url = `https://api.smspool.net/purchase/sms?key=${SMSPOOL_KEY}&country=${SMSPOOL_COUNTRY}&service=${SMSPOOL_SERVICE}&max_price=0.12`;
+  const isFivesim = PROVIDER === '5sim';
+  const url = isFivesim
+    ? `https://5sim.net/v1/user/buy/activation/${FIVESIM_COUNTRY}/${FIVESIM_OPERATOR}/${FIVESIM_PRODUCT}`
+    : `https://api.smspool.net/purchase/sms?key=${SMSPOOL_KEY}&country=${SMSPOOL_COUNTRY}&service=${SMSPOOL_SERVICE}&max_price=0.12`;
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const data = await fetchWithTimeout(url);
-      if (data.success === 1) {
-        console.log(`  [${tag}] Number: ${data.phonenumber} (${data.order_id})`);
-        return { phone: data.phonenumber, orderId: data.order_id };
+      const data = await fetchWithTimeout(url, 15000, isFivesim ? fivesimHeaders() : {});
+      if (isFivesim) {
+        if (data && data.id && data.phone) {
+          console.log(`  [${tag}] Number: ${data.phone} (${data.id})`);
+          return { phone: data.phone, orderId: data.id };
+        }
+        console.error(`  [${tag}] 5sim order attempt ${attempt}: ${JSON.stringify(data)}`);
+      } else {
+        if (data.success === 1) {
+          console.log(`  [${tag}] Number: ${data.phonenumber} (${data.order_id})`);
+          return { phone: data.phonenumber, orderId: data.order_id };
+        }
+        console.error(`  [${tag}] SMSPool order attempt ${attempt}: ${JSON.stringify(data)}`);
       }
-      console.error(`  [${tag}] SMSPool order attempt ${attempt}: ${JSON.stringify(data)}`);
     } catch (err) {
-      console.error(`  [${tag}] SMSPool order attempt ${attempt} network error: ${err.message}`);
+      console.error(`  [${tag}] ${isFivesim ? '5sim' : 'SMSPool'} order attempt ${attempt} network error: ${err.message}`);
     }
     if (attempt < retries) await new Promise(r => setTimeout(r, 3000));
   }
-  throw new Error('SMSPool order failed after retries');
+  throw new Error(`${isFivesim ? '5sim' : 'SMSPool'} order failed after retries`);
 }
 
 async function cancelSmsOrder(orderId, tag) {
   try {
-    await fetchWithTimeout(`https://api.smspool.net/sms/cancel?key=${SMSPOOL_KEY}&orderid=${orderId}`);
+    if (PROVIDER === '5sim') {
+      await fetchWithTimeout(`https://5sim.net/v1/user/cancel/${orderId}`, 15000, fivesimHeaders());
+    } else {
+      await fetchWithTimeout(`https://api.smspool.net/sms/cancel?key=${SMSPOOL_KEY}&orderid=${orderId}`);
+    }
   } catch (err) {
     console.error(`  [${tag}] Cancel order ${orderId} failed: ${err.message}`);
   }
 }
 
-async function resendSms(orderId, tag, lastResendTime = 0) {
-  // SMSPool requires ~60s between resends
-  const elapsed = Date.now() - lastResendTime;
-  const waitNeeded = Math.max(0, 15000 - elapsed);
-  if (waitNeeded > 0) {
-    console.log(`  [${tag}] Waiting ${Math.ceil(waitNeeded / 1000)}s before resend...`);
-    await new Promise(r => setTimeout(r, waitNeeded));
-  }
-
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const data = await fetchWithTimeout(`https://api.smspool.net/sms/resend?key=${SMSPOOL_KEY}&orderid=${orderId}`);
-      if (data.success === 1) {
-        console.log(`  [${tag}] Resend OK`);
-        return true;
-      }
-      const msg = data.message || '';
-      if (msg.includes('wait a minute')) {
-        console.log(`  [${tag}] Resend rate limited, waiting 30s...`);
-        await new Promise(r => setTimeout(r, 30000));
-        continue;
-      }
-      if (msg.includes('only re-send to a phonenumber that has received')) {
-        console.log(`  [${tag}] Number never received first SMS — cannot resend`);
-        return false;
-      }
-      console.log(`  [${tag}] Resend attempt ${attempt}: ${JSON.stringify(data)}`);
-    } catch (err) {
-      console.error(`  [${tag}] Resend attempt ${attempt} error: ${err.message}`);
-    }
-    if (attempt < 3) await new Promise(r => setTimeout(r, 5000));
-  }
-  return false;
-}
-
 async function pollForCode(orderId, tag, attempts, previousCodes = []) {
+  const isFivesim = PROVIDER === '5sim';
   for (let i = 0; i < attempts; i++) {
     await new Promise(r => setTimeout(r, 3000));
     try {
-      const data = await fetchWithTimeout(`https://api.smspool.net/sms/check?key=${SMSPOOL_KEY}&orderid=${orderId}`);
-      if (data.status === 3 || data.sms) {
-        const fullSms = data.sms || data.full_sms || '';
-        const match = fullSms.match(/(\d{4,6})/);
-        const code = match ? match[1] : fullSms;
-        if (previousCodes.includes(code)) continue;
-        console.log(`  [${tag}] SMS code: ${code}`);
-        return code;
+      if (isFivesim) {
+        const data = await fetchWithTimeout(`https://5sim.net/v1/user/check/${orderId}`, 15000, fivesimHeaders());
+        if (data && Array.isArray(data.sms) && data.sms.length) {
+          const last = data.sms[data.sms.length - 1];
+          const code = last.code || (last.text || '').match(/(\d{4,6})/)?.[1] || '';
+          if (!code || previousCodes.includes(code)) continue;
+          console.log(`  [${tag}] SMS code: ${code}`);
+          return code;
+        }
+      } else {
+        const data = await fetchWithTimeout(`https://api.smspool.net/sms/check?key=${SMSPOOL_KEY}&orderid=${orderId}`);
+        if (data.status === 3 || data.sms) {
+          const fullSms = data.sms || data.full_sms || '';
+          const match = fullSms.match(/(\d{4,6})/);
+          const code = match ? match[1] : fullSms;
+          if (previousCodes.includes(code)) continue;
+          console.log(`  [${tag}] SMS code: ${code}`);
+          return code;
+        }
       }
     } catch {}
   }
@@ -167,14 +200,14 @@ async function launchBrowser(proxy, tag) {
 
 // ── Step 1: Fill personal info and navigate to phone page ──
 
-async function step1_fillInfo(page, email, firstNames, lastNames, postalCodes, tag) {
+async function step1_fillInfo(page, email, formUrl, firstNames, lastNames, postalCodes, tag) {
   const firstName = randomFrom(firstNames);
   const lastName = randomFrom(lastNames);
   const postalCode = randomFrom(postalCodes);
 
   console.log(`  [${tag}] ${firstName} ${lastName} | ${email} | ${postalCode}`);
 
-  await page.goto(FORM_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+  await page.goto(formUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
   await page.waitForSelector('input', { timeout: 15000 });
   await page.waitForTimeout(1500);
 
@@ -212,20 +245,72 @@ async function step1_fillInfo(page, email, firstNames, lastNames, postalCodes, t
   throw new Error(`Stuck on step 1: ${bodyText.substring(0, 150)}`);
 }
 
+// Returns true once the "Verify" button is enabled (Turnstile passed).
+// NOTE: the phone page also has an unrelated, always-enabled "Next" submit button,
+// so we must gate specifically on the Verify button's text — not just any
+// non-disabled submit, or we'd false-positive and skip solving Turnstile.
+async function submitEnabled(page) {
+  return page.evaluate(() => {
+    const btns = Array.from(document.querySelectorAll('button[type="submit"]'));
+    const verify = btns.filter(b => (b.innerText || '').trim().toLowerCase() === 'verify');
+    return verify.length > 0 && verify.some(b => !b.disabled);
+  }).catch(() => false);
+}
+
+// Cloudflare Turnstile renders as an interactive checkbox that must be clicked.
+// Its iframe is NESTED (the outer <iframe> has no src; the real challenge UI is
+// a child frame whose URL is on challenges.cloudflare.com) and the checkbox lives
+// in shadow DOM, so neither a `src`-based selector nor a checkbox selector works.
+// What does work: grab the cloudflare frame from the frame tree and click its body
+// near the top-left, where the checkbox sits. We poll until the submit button
+// enables (auto-mode passes on its own; interactive mode needs the click).
+async function solveTurnstile(page, tag, timeoutMs = 120000) {
+  console.log(`  [${tag}] Waiting for Turnstile...`);
+  const deadline = Date.now() + timeoutMs;
+  let lastClick = 0;
+  let clicks = 0;
+
+  while (Date.now() < deadline) {
+    if (await submitEnabled(page)) return;
+
+    // Click only once every ~8s. Turnstile takes a few seconds to verify after a
+    // click; clicking again mid-verification resets it, so it never completes.
+    // Between clicks we just poll for the button to enable.
+    if (Date.now() - lastClick > 8000) {
+      const cf = page.frames().find(f => f.url().includes('challenges.cloudflare.com'));
+      if (cf) {
+        try {
+          const cb = cf.locator('input[type="checkbox"]').first();
+          if (await cb.isVisible({ timeout: 1000 }).catch(() => false)) {
+            await cb.click({ timeout: 2000 });
+          } else {
+            await cf.locator('body').click({ position: { x: 30, y: 30 }, timeout: 2000 });
+          }
+          lastClick = Date.now();
+          clicks++;
+          console.log(`  [${tag}] Clicked Turnstile (attempt ${clicks})`);
+        } catch {}
+      }
+    }
+
+    await page.waitForTimeout(1000);
+  }
+
+  throw new Error('Turnstile not solved before timeout');
+}
+
 // ── Step 2: Enter phone, solve captcha, click verify ──
 
 async function step2_phone(page, phoneDigits, tag) {
   const phoneInput = await page.waitForSelector('input[type="tel"]', { timeout: 15000 });
+  // All events are US, so the form already defaults to a US (+1) country code.
   await phoneInput.fill('');
   await phoneInput.fill(phoneDigits);
 
-  console.log(`  [${tag}] Waiting for Turnstile...`);
-  await page.waitForFunction(() => {
-    const btns = document.querySelectorAll('button[type="submit"]');
-    return Array.from(btns).some(b => !b.disabled);
-  }, { timeout: 120000 });
+  await solveTurnstile(page, tag);
 
-  await page.locator('button[type="submit"]:not([disabled])').first().click({ timeout: 10000 });
+  // Click the Verify button specifically (not the unrelated, always-enabled "Next").
+  await page.locator('button[type="submit"]:has-text("Verify"):not([disabled])').first().click({ timeout: 10000 });
   await page.waitForTimeout(3000);
 
   // Check for "Issue validating number" error
@@ -278,208 +363,186 @@ async function step3_enterCode(page, smsCode, tag) {
     if (confirmVisible) { await confirmBtn.click(); } else { await page.click('button[type="submit"]'); }
     await page.waitForTimeout(1500);
   }
-}
 
-// ── Run one email (steps 1-3) with an existing browser + number ──
+  // Handle optional quantity + price pages that can appear after SMS code.
+  // Defaults are already selected — just click "Next" on each.
+  for (let i = 0; i < 4; i++) {
+    const body = await page.innerText('body').catch(() => '');
+    const isQuantityPage = body.includes('How many tickets are you looking to buy');
+    const isPricePage = body.includes('How much are you willing to spend per ticket');
+    if (!isQuantityPage && !isPricePage) break;
 
-async function runOneEmail(page, email, phoneDigits, orderId, firstNames, lastNames, postalCodes, tag, previousCodes) {
-  // Step 1
-  await step1_fillInfo(page, email, firstNames, lastNames, postalCodes, tag);
+    const label = isQuantityPage ? 'Quantity' : 'Price';
+    console.log(`  [${tag}] ${label} page — clicking Next (default selected)...`);
 
-  // Step 2
-  await step2_phone(page, phoneDigits, tag);
-
-  // Step 3: poll for code
-  const smsCode = await pollForCode(orderId, tag, 20, previousCodes);
-  if (!smsCode) throw new Error('No SMS received');
-
-  await step3_enterCode(page, smsCode, tag);
-
-  markCompleted(email);
-  console.log(`${GREEN}  [${tag}] SUCCESS — ${email}${RESET}`);
-  return smsCode;
-}
-
-// ── Process a group of up to 3 emails with one phone number ──
-
-async function processGroup(emails, firstNames, lastNames, postalCodes, groupTag) {
-  const proxy = loadProxy();
-  let browser = null;
-  let orderId = null;
-  const results = [];
-
-  try {
-    // Buy number
-    const order = await orderSmsNumber(groupTag);
-    orderId = order.orderId;
-    const phoneDigits = order.phone.toString().replace(/^\+?1/, '');
-
-    // Launch browser
-    const launched = await launchBrowser(proxy, groupTag);
-    browser = launched.browser;
-    const page = launched.page;
-
-    const usedCodes = [];
-    let lastResendTime = 0;
-
-    for (let i = 0; i < emails.length; i++) {
-      const email = emails[i];
-      const tag = `${groupTag}:${i + 1}/${emails.length}`;
-
-      // For 2nd and 3rd email, resend SMS to the same number
-      if (i > 0) {
-        console.log(`  [${tag}] Requesting resend...`);
-        const resendOk = await resendSms(orderId, tag, lastResendTime);
-        lastResendTime = Date.now();
-        if (!resendOk) {
-          console.log(`  [${tag}] Resend failed — buying new number for remaining emails`);
-          await cancelSmsOrder(orderId, groupTag);
-          try {
-            const newOrder = await orderSmsNumber(tag);
-            orderId = newOrder.orderId;
-            const newDigits = newOrder.phone.toString().replace(/^\+?1/, '');
-            usedCodes.length = 0;
-            lastResendTime = 0;
-
-            try {
-              const code = await runOneEmail(page, email, newDigits, orderId, firstNames, lastNames, postalCodes, tag, usedCodes);
-              usedCodes.push(code);
-              results.push({ email, ok: true });
-            } catch (err) {
-              console.error(`${RED}  [${tag}] FAILED — ${email}: ${err.message}${RESET}`);
-              results.push({ email, ok: false });
-            }
-            continue;
-          } catch (err) {
-            console.error(`  [${tag}] New number also failed: ${err.message}`);
-            results.push({ email, ok: false });
-            continue;
-          }
-        }
-      }
-
-      try {
-        const code = await runOneEmail(page, email, phoneDigits, orderId, firstNames, lastNames, postalCodes, tag, usedCodes);
-        usedCodes.push(code);
-        results.push({ email, ok: true });
-      } catch (err) {
-        console.error(`${RED}  [${tag}] FAILED — ${email}: ${err.message}${RESET}`);
-        results.push({ email, ok: false });
-
-        // If step 1 or browser crashed, try to recover for remaining emails
-        try {
-          const currentUrl = page.url();
-          if (!currentUrl || currentUrl === 'about:blank') throw new Error('page dead');
-        } catch {
-          console.log(`  [${tag}] Page is dead — cannot continue group`);
-          for (let j = i + 1; j < emails.length; j++) {
-            results.push({ email: emails[j], ok: false });
-          }
-          break;
-        }
-      }
-    }
-
-    await killBrowser(browser, groupTag);
-    browser = null;
-    return results;
-  } catch (err) {
-    console.error(`${RED}  [${groupTag}] GROUP FAILED: ${err.message}${RESET}`);
-    // Mark all unprocessed emails as failed
-    const processed = new Set(results.map(r => r.email));
-    for (const email of emails) {
-      if (!processed.has(email)) results.push({ email, ok: false });
-    }
-    if (orderId) await cancelSmsOrder(orderId, groupTag);
-    await killBrowser(browser, groupTag);
-    return results;
+    const nextBtn = page.locator('button:has-text("Next")').first();
+    const nextVisible = await nextBtn.isVisible().catch(() => false);
+    if (nextVisible) { await nextBtn.click(); } else { await page.click('button[type="submit"]'); }
+    await page.waitForTimeout(1500);
   }
 }
 
-// ── MAIN: polling-based concurrency manager ──
+// ── Process ONE email end-to-end, retrying up to MAX_ATTEMPTS times. ──
+// Every attempt gets a fresh proxy, a fresh SMS number, and a fresh browser,
+// so a bad proxy / dead number / crashed browser on one try doesn't doom the email.
+// Returns true on success, false only after all attempts are exhausted.
+
+async function processEmail(email, formUrl, completedFile, firstNames, lastNames, postalCodes, tag) {
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    const aTag = `${tag} a${attempt}/${MAX_ATTEMPTS}`;
+    const proxy = loadProxy();
+    let browser = null;
+    let orderId = null;
+
+    try {
+      const order = await orderSmsNumber(aTag);
+      orderId = order.orderId;
+      const phoneDigits = order.phone.toString().replace(/^\+?1/, '');
+
+      const launched = await launchBrowser(proxy, aTag);
+      browser = launched.browser;
+      const page = launched.page;
+
+      await withTimeout((async () => {
+        await step1_fillInfo(page, email, formUrl, firstNames, lastNames, postalCodes, aTag);
+        await step2_phone(page, phoneDigits, aTag);
+        const smsCode = await pollForCode(orderId, aTag, 20);
+        if (!smsCode) throw new Error('No SMS received');
+        await step3_enterCode(page, smsCode, aTag);
+      })(), ATTEMPT_TIMEOUT_MS, 'attempt');
+
+      markCompleted(completedFile, email);
+      console.log(`${GREEN}  [${aTag}] SUCCESS — ${email}${RESET}`);
+      return true;
+    } catch (err) {
+      console.error(`${RED}  [${aTag}] attempt failed — ${email}: ${err.message}${RESET}`);
+      if (orderId) await cancelSmsOrder(orderId, aTag);
+      if (attempt < MAX_ATTEMPTS) {
+        console.log(`  [${aTag}] Retrying in 5s with fresh number + proxy...`);
+        await new Promise(r => setTimeout(r, 5000));
+      }
+    } finally {
+      await killBrowser(browser, aTag);
+    }
+  }
+
+  console.error(`${RED}  [${tag}] GAVE UP after ${MAX_ATTEMPTS} attempts — ${email}${RESET}`);
+  return false;
+}
+
+// ── Single global pool: keep CONCURRENCY emails in flight across ALL events. ──
+// As soon as one email finishes (success or final failure), the next pending
+// email from any event launches — the pool never drains between events.
+
+function runGlobalPool(tasks, firstNames, lastNames, postalCodes) {
+  return new Promise((resolve) => {
+    let succeeded = 0;
+    let failed = 0;
+    let nextIdx = 0;
+    const active = new Map();
+
+    function launch() {
+      if (nextIdx >= tasks.length) return;
+      const idx = nextIdx++;
+      const t = tasks[idx];
+      const tag = `${idx + 1}/${tasks.length} ${t.eventShort}`;
+      const entry = { tag, task: t, startTime: Date.now(), done: false, ok: false };
+      active.set(idx, entry);
+
+      console.log(`  >> Launched [${tag}] ${t.email} — ${active.size} active`);
+
+      processEmail(t.email, t.event.url, t.completedFile, firstNames, lastNames, postalCodes, tag)
+        .then((ok) => { entry.ok = ok; })
+        .catch(() => { entry.ok = false; })
+        .finally(() => { entry.done = true; });
+    }
+
+    const interval = setInterval(() => {
+      const now = Date.now();
+
+      // Reap finished + drop timed-out (backstop; processEmail self-bounds per attempt)
+      for (const [idx, entry] of active) {
+        if (entry.done) {
+          if (entry.ok) succeeded++; else failed++;
+          active.delete(idx);
+        } else if (now - entry.startTime > TASK_TIMEOUT_MS) {
+          console.log(`  [${entry.tag}] HARD KILL (timeout) — ${entry.task.email}`);
+          failed++;
+          active.delete(idx);
+        }
+      }
+
+      // Top up to CONCURRENCY from the single global queue
+      while (active.size < CONCURRENCY && nextIdx < tasks.length) launch();
+
+      console.log(`  [POOL] ${active.size} active | ${GREEN}${succeeded} ok${RESET} | ${RED}${failed} fail${RESET} | ${tasks.length - nextIdx} queued`);
+
+      if (active.size === 0 && nextIdx >= tasks.length) {
+        clearInterval(interval);
+        resolve({ succeeded, failed });
+      }
+    }, 2000);
+
+    // Initial fill
+    while (active.size < CONCURRENCY && nextIdx < tasks.length) launch();
+  });
+}
+
+// ── MAIN: split emails across events, flatten into one global queue, run pool ──
 
 (async () => {
+  const provAnswer = await askQuestion('SMS provider? 1 = SMSPool, 2 = 5sim (default 1): ');
+  PROVIDER = provAnswer.trim() === '2' ? '5sim' : 'smspool';
+  console.log(`Using SMS provider: ${PROVIDER}`);
+
   const answer = await askQuestion('How many concurrent windows? (default 10): ');
   CONCURRENCY = parseInt(answer, 10) || 10;
 
-  const reuseAnswer = await askQuestion('Reuse phone numbers? (y = reuse up to 3x, n = fresh number per email) [n]: ');
-  USES_PER_NUMBER = reuseAnswer.toLowerCase() === 'y' ? 3 : 1;
-
   const allEmails = loadLines('emails.txt').filter(l => l.includes('@'));
   const uniqueEmails = [...new Set(allEmails)];
-  const completed = loadCompleted();
-  const pending = uniqueEmails.filter(e => !completed.has(e));
 
-  console.log(`Total: ${uniqueEmails.length} | Done: ${completed.size} | Remaining: ${pending.length}`);
-  console.log(`Concurrency: ${CONCURRENCY} groups | ${USES_PER_NUMBER} email${USES_PER_NUMBER > 1 ? 's' : ''}/number | US numbers only\n`);
-  if (!pending.length) { console.log('All emails done!'); process.exit(0); }
-
-  const groups = [];
-  for (let i = 0; i < pending.length; i += USES_PER_NUMBER) {
-    groups.push(pending.slice(i, i + USES_PER_NUMBER));
+  // Slice the email list sequentially across events (first N → event 1, etc.).
+  // Deterministic on emails.txt order, so reruns assign the same emails to the same events.
+  const assignments = [];
+  let cursor = 0;
+  for (const event of EVENTS) {
+    const slice = uniqueEmails.slice(cursor, cursor + event.count);
+    cursor += event.count;
+    assignments.push({ event, emails: slice });
   }
-  console.log(`  ${groups.length} groups to process\n`);
+  const leftover = uniqueEmails.length - cursor;
 
   const firstNames = loadLines('firstNames.txt');
   const lastNames = loadLines('lastNames.txt');
   const postalCodes = loadLines('postalCodes.txt');
 
-  let succeeded = 0;
-  let failed = 0;
-  let nextGroupIdx = 0;
-
-  const tasks = new Map();
-
-  function launch() {
-    if (nextGroupIdx >= groups.length) return;
-    const idx = nextGroupIdx++;
-    const group = groups[idx];
-    const tag = `G${idx + 1}/${groups.length}`;
-    const entry = { tag, group, startTime: Date.now(), done: false, results: null };
-    tasks.set(idx, entry);
-
-    console.log(`  >> Launched [${tag}] ${group.join(', ')} — ${tasks.size} active`);
-
-    processGroup(group, firstNames, lastNames, postalCodes, tag)
-      .then((results) => { entry.results = results; })
-      .catch(() => { entry.results = group.map(e => ({ email: e, ok: false })); })
-      .finally(() => { entry.done = true; });
+  // Build ONE global task list across all events, skipping already-completed emails.
+  const tasks = [];
+  let totalAssigned = 0;
+  let totalDone = 0;
+  for (const { event, emails } of assignments) {
+    const completedFile = completedFileFor(event.url);
+    const completed = loadCompleted(completedFile);
+    totalAssigned += emails.length;
+    for (const email of emails) {
+      if (completed.has(email)) { totalDone++; continue; }
+      tasks.push({ email, event, completedFile, eventShort: event.name });
+    }
   }
 
-  const interval = setInterval(() => {
-    const now = Date.now();
+  console.log(`Loaded ${uniqueEmails.length} unique emails across ${EVENTS.length} events.`);
+  if (leftover > 0) console.log(`${RED}  Note: ${leftover} extra email(s) beyond the planned total are unassigned.${RESET}`);
+  console.log(`Assigned: ${totalAssigned} | Already done: ${totalDone} | Pending: ${tasks.length}`);
+  console.log(`Global pool: ${CONCURRENCY} concurrent | up to ${MAX_ATTEMPTS} attempts/email | fresh number+proxy per attempt\n`);
 
-    // Reap finished + kill timed out
-    for (const [idx, entry] of tasks) {
-      if (entry.done) {
-        for (const r of (entry.results || [])) {
-          if (r.ok) succeeded++; else failed++;
-        }
-        tasks.delete(idx);
-      } else if (now - entry.startTime > TASK_TIMEOUT_MS) {
-        console.log(`  [${entry.tag}] HARD KILL (timeout) — ${entry.group.join(', ')}`);
-        for (const e of entry.group) failed++;
-        tasks.delete(idx);
-      }
-    }
-
-    // Top up
-    while (tasks.size < CONCURRENCY && nextGroupIdx < groups.length) {
-      launch();
-    }
-
-    console.log(`  [POOL] ${tasks.size} active | ${GREEN}${succeeded} ok${RESET} | ${RED}${failed} fail${RESET} | ${groups.length - nextGroupIdx} groups queued`);
-
-    if (tasks.size === 0 && nextGroupIdx >= groups.length) {
-      clearInterval(interval);
-      console.log(`\n=== ALL DONE === ${GREEN}${succeeded} ok${RESET}, ${RED}${failed} fail${RESET}`);
-      console.log(`  See completed.txt for the list.`);
-      process.exit(0);
-    }
-  }, 2000);
-
-  // Initial launch
-  while (tasks.size < CONCURRENCY && nextGroupIdx < groups.length) {
-    launch();
+  if (!tasks.length) {
+    console.log('Nothing pending across any event — done.');
+    process.exit(0);
   }
+
+  const { succeeded, failed } = await runGlobalPool(tasks, firstNames, lastNames, postalCodes);
+
+  console.log(`\n=== ALL DONE === ${GREEN}${succeeded} ok${RESET}, ${RED}${failed} fail${RESET}`);
+  console.log(`  Per-event progress is in completed-<eventId>.txt files.`);
+  process.exit(0);
 })();
