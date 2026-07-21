@@ -32,13 +32,20 @@ const TASK_TIMEOUT_MS = 600000;
 // ── Events: emails.txt is split sequentially across these in order.
 // First `count` emails → first event, next `count` → second event, etc.
 // Each event tracks its own progress in completed-<eventId>.txt, so reruns resume.
+// const EVENTS = [
+//   { name: '1',              url: 'https://go.seated.com/waitlist/eef1df7f-2006-40c4-82df-2a5adb852c89/info', count: 100 },
+//   { name: '2',              url: 'https://go.seated.com/waitlist/96ec4fdc-cb80-46a8-8b4c-101c72819c27/info', count: 100 },
+//   { name: '3',              url: 'https://go.seated.com/waitlist/8bf8a239-eff2-4696-8106-dde262a56408/info', count: 400 },
+//   { name: '4',              url: 'https://go.seated.com/waitlist/b0451655-f085-45b5-a194-650919017412/info', count: 400 },
+
+// ];
+
 const EVENTS = [
-  { name: 'Lubbock',              url: 'https://go.seated.com/event-reminders/0776364a-50c3-4839-a70c-b3557949b8f5/info', count: 167 },
-  { name: 'Morrison',              url: 'https://go.seated.com/event-reminders/69a8b2c5-8750-435a-b2d4-6674f4b10d2c/info', count: 167 },
-  { name: 'Athens',              url: 'https://go.seated.com/event-reminders/79045e33-7a38-48a3-a37e-158b325afffc/info', count: 167 },
-  { name: 'Auburn',              url: 'https://go.seated.com/event-reminders/a0ca9386-de04-4c9e-88ee-1ab7ed9e797a/info', count: 167 },
-  { name: 'State College',              url: 'https://go.seated.com/event-reminders/5e995dc3-acee-4ecc-b88f-15be6a2489a7/info', count: 167 },
-  { name: 'LA',              url: 'https://go.seated.com/event-reminders/b34b425d-37a8-4e5c-8839-969323690e21/info', count: 167 }
+  { name: '1',              url: 'https://go.seated.com/event-reminders/440f4b5e-b9ef-42c8-a670-1e955347232e/info', count: 100 }
+  // { name: '2',              url: 'https://go.seated.com/waitlist/96ec4fdc-cb80-46a8-8b4c-101c72819c27/info', count: 100 },
+  // { name: '3',              url: 'https://go.seated.com/waitlist/8bf8a239-eff2-4696-8106-dde262a56408/info', count: 400 },
+  // { name: '4',              url: 'https://go.seated.com/waitlist/b0451655-f085-45b5-a194-650919017412/info', count: 400 },
+
 ];
 
 function eventId(url) { return url.match(/\/([a-f0-9-]{36})\//)?.[1] || 'default'; }
@@ -97,7 +104,7 @@ async function orderSmsNumber(tag, retries = 3) {
   const isFivesim = PROVIDER === '5sim';
   const url = isFivesim
     ? `https://5sim.net/v1/user/buy/activation/${FIVESIM_COUNTRY}/${FIVESIM_OPERATOR}/${FIVESIM_PRODUCT}`
-    : `https://api.smspool.net/purchase/sms?key=${SMSPOOL_KEY}&country=${SMSPOOL_COUNTRY}&service=${SMSPOOL_SERVICE}&max_price=0.12`;
+    : `https://api.smspool.net/purchase/sms?key=${SMSPOOL_KEY}&country=${SMSPOOL_COUNTRY}&service=${SMSPOOL_SERVICE}&max_price=0.14`;
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
       const data = await fetchWithTimeout(url, 15000, isFivesim ? fivesimHeaders() : {});
