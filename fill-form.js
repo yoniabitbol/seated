@@ -1,555 +1,276 @@
-const { chromium } = require('playwright');
-const fs = require('fs');
-const path = require('path');
-const readline = require('readline');
+#!/usr/bin/env node
+// Seated waitlist/reminder signup automation - headless, parallel, low-memory.
+//
+// One real Chrome process (headless=new) hosts N incognito contexts, each with
+// its own proxy/timezone. Turnstile is solved via CapSolver (click fallback).
+// SMS numbers are only ordered AFTER step 1 + Turnstile succeed, and survive
+// retries until Verify is clicked - so proxy/captcha failures cost $0.
+//
+// Usage:
+//   node fill-form.js [options]
+//     --workers N        concurrent contexts (default 15)
+//     --rpm N            max task starts per minute (default 8)
+//     --limit N          process at most N emails this run (0 = all)
+//     --provider P       smspool | 5sim | mix (default smspool)
+//     --headed           show the browser (debugging)
+//     --dry-run          print the plan, do nothing
+//   Ctrl-C once = finish in-flight tasks; twice = quit now.
+const cfg = require('./lib/config');
+const { BrowserManager } = require('./lib/browser');
+const { ProxyPool, ProxyError } = require('./lib/proxies');
+const sms = require('./lib/sms');
+const flow = require('./lib/flow');
+const store = require('./lib/store');
 
 const GREEN = '\x1b[32m';
 const RED = '\x1b[31m';
+const YELLOW = '\x1b[33m';
 const RESET = '\x1b[0m';
 
-function askQuestion(query) {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-  return new Promise(resolve => rl.question(query, ans => { rl.close(); resolve(ans); }));
-}
-
-const SMSPOOL_KEY = 'FseOMNf1VXHO0y9tmOnzS61rO7BXxK8f';
-const SMSPOOL_SERVICE = '810';
-const SMSPOOL_COUNTRY = '1';
-
-// 5sim provider config (https://5sim.net/v1). Auth is a JWT bearer token.
-const FIVESIM_KEY = 'eyJhbGciOiJSUzUxMiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE4MTIzNzc3NDYsImlhdCI6MTc4MDg0MTc0NiwicmF5IjoiOWQ3YzRmNzA4NDE1ZTVkNTViYzI3YmJjYmUxNzljNmMiLCJzdWIiOjQxNzg3NTd9.BF_Bqn4Xhi0vgUYNgc_xAmBYc3kUpdrt-4H0JJ45Znf35MIRANDj4T8T8jciTF-NLoIy2kCJ8XpGF-aPcYOmUfIiGdsu4l2pef9y65S2Xo_xTWqDCgOG3FfB2x9JbnGor2GBjQpthxF5tYhz6-KYPelkOgRv3sP4VsR-jjNkX6VPrZh62S4veibqg-NzMG67U6Q0jyfC-lJNvnMDnMvrA1A3EOEMRDksE44JX9qEfHdxCoTXbYxHRLPtYjvbjn0XA9JVA2fkSu--QNT7Ju6IZlyHeWWETu8WvrGgp4w_UUd_XO0UyJZkgVJfZ_YttR1TI3NadmSiejykIvbI-yGABw';
-const FIVESIM_COUNTRY = 'usa';
-const FIVESIM_OPERATOR = 'any';
-const FIVESIM_PRODUCT = 'seated';
-
-// Which SMS provider to use: 'smspool' or '5sim'. Set from the startup dialog.
-let PROVIDER = 'smspool';
-
-let CONCURRENCY = 10;
-let USES_PER_NUMBER = 1;
-const TASK_TIMEOUT_MS = 600000;
-
-// ── Events: emails.txt is split sequentially across these in order.
-// First `count` emails → first event, next `count` → second event, etc.
-// Each event tracks its own progress in completed-<eventId>.txt, so reruns resume.
-// const EVENTS = [
-//   { name: '1',              url: 'https://go.seated.com/waitlist/eef1df7f-2006-40c4-82df-2a5adb852c89/info', count: 100 },
-//   { name: '2',              url: 'https://go.seated.com/waitlist/96ec4fdc-cb80-46a8-8b4c-101c72819c27/info', count: 100 },
-//   { name: '3',              url: 'https://go.seated.com/waitlist/8bf8a239-eff2-4696-8106-dde262a56408/info', count: 400 },
-//   { name: '4',              url: 'https://go.seated.com/waitlist/b0451655-f085-45b5-a194-650919017412/info', count: 400 },
-
-// ];
-
-const EVENTS = [
-  { name: '1',              url: 'https://go.seated.com/event-reminders/440f4b5e-b9ef-42c8-a670-1e955347232e/info', count: 100 }
-  // { name: '2',              url: 'https://go.seated.com/waitlist/96ec4fdc-cb80-46a8-8b4c-101c72819c27/info', count: 100 },
-  // { name: '3',              url: 'https://go.seated.com/waitlist/8bf8a239-eff2-4696-8106-dde262a56408/info', count: 400 },
-  // { name: '4',              url: 'https://go.seated.com/waitlist/b0451655-f085-45b5-a194-650919017412/info', count: 400 },
-
-];
-
-function eventId(url) { return url.match(/\/([a-f0-9-]{36})\//)?.[1] || 'default'; }
-function completedFileFor(url) { return path.join(__dirname, `completed-${eventId(url)}.txt`); }
-
-// ── Utilities ──
-
-function loadLines(file) {
-  return fs.readFileSync(path.join(__dirname, file), 'utf-8').split('\n').map(l => l.trim()).filter(Boolean);
-}
-function randomFrom(lines) { return lines[Math.floor(Math.random() * lines.length)]; }
-function loadCompleted(completedFile) {
-  if (!fs.existsSync(completedFile)) return new Set();
-  return new Set(fs.readFileSync(completedFile, 'utf-8').split('\n').map(l => l.trim()).filter(Boolean));
-}
-function markCompleted(completedFile, email) { fs.appendFileSync(completedFile, email + '\n'); }
-function loadProxy() {
-  const lines = loadLines('isp.txt');
-  const raw = randomFrom(lines);
-  const p = raw.split(':');
-  return { server: `http://${p[0]}:${p[1]}`, username: p[2], password: p[3] };
-}
-
-// Retry config (kept out of the protected constants block above).
-const MAX_ATTEMPTS = 3;            // attempts per email before giving up
-const ATTEMPT_TIMEOUT_MS = 300000; // 5 min cap per attempt (browser is killed on timeout)
-
-// Run `promise` but reject if it doesn't settle within `ms`. The caller is
-// responsible for cleanup (killing the browser) so a hung step never leaks.
-function withTimeout(promise, ms, label) {
-  let timer;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)), ms);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
-
-// ── SMSPool API (all calls wrapped with retry + timeout) ──
-
-async function fetchWithTimeout(url, timeoutMs = 15000, headers = {}) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { signal: controller.signal, headers });
-    return await res.json();
-  } finally {
-    clearTimeout(timer);
+// ── CLI ──
+function parseArgs(argv) {
+  const args = { workers: cfg.DEFAULT_WORKERS, rpm: cfg.DEFAULT_RPM, limit: 0, provider: 'smspool', headed: false, dryRun: false };
+  for (let i = 2; i < argv.length; i++) {
+    const a = argv[i];
+    const next = () => argv[++i];
+    if (a === '--workers') args.workers = parseInt(next(), 10) || args.workers;
+    else if (a === '--rpm') args.rpm = parseInt(next(), 10) || args.rpm;
+    else if (a === '--limit') args.limit = parseInt(next(), 10) || 0;
+    else if (a === '--provider') args.provider = next();
+    else if (a === '--headed') args.headed = true;
+    else if (a === '--dry-run') args.dryRun = true;
+    else if (a === '--help' || a === '-h') {
+      console.log('node fill-form.js [--workers N] [--rpm N] [--limit N] [--provider smspool|5sim|mix] [--headed] [--dry-run]');
+      process.exit(0);
+    }
   }
+  return args;
 }
 
-function fivesimHeaders() {
-  return { Authorization: `Bearer ${FIVESIM_KEY}`, Accept: 'application/json' };
-}
-
-async function orderSmsNumber(tag, retries = 3) {
-  const isFivesim = PROVIDER === '5sim';
-  const url = isFivesim
-    ? `https://5sim.net/v1/user/buy/activation/${FIVESIM_COUNTRY}/${FIVESIM_OPERATOR}/${FIVESIM_PRODUCT}`
-    : `https://api.smspool.net/purchase/sms?key=${SMSPOOL_KEY}&country=${SMSPOOL_COUNTRY}&service=${SMSPOOL_SERVICE}&max_price=0.14`;
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const data = await fetchWithTimeout(url, 15000, isFivesim ? fivesimHeaders() : {});
-      if (isFivesim) {
-        if (data && data.id && data.phone) {
-          console.log(`  [${tag}] Number: ${data.phone} (${data.id})`);
-          return { phone: data.phone, orderId: data.id };
-        }
-        console.error(`  [${tag}] 5sim order attempt ${attempt}: ${JSON.stringify(data)}`);
-      } else {
-        if (data.success === 1) {
-          console.log(`  [${tag}] Number: ${data.phonenumber} (${data.order_id})`);
-          return { phone: data.phonenumber, orderId: data.order_id };
-        }
-        console.error(`  [${tag}] SMSPool order attempt ${attempt}: ${JSON.stringify(data)}`);
+// Rolling-window rate limiter: at most `rpm` task starts per minute.
+class RateLimiter {
+  constructor(rpm) { this.rpm = rpm; this.stamps = []; }
+  async wait() {
+    for (;;) {
+      const now = Date.now();
+      this.stamps = this.stamps.filter(t => now - t < 60000);
+      if (this.stamps.length < this.rpm) {
+        this.stamps.push(now);
+        return;
       }
-    } catch (err) {
-      console.error(`  [${tag}] ${isFivesim ? '5sim' : 'SMSPool'} order attempt ${attempt} network error: ${err.message}`);
-    }
-    if (attempt < retries) await new Promise(r => setTimeout(r, 3000));
-  }
-  throw new Error(`${isFivesim ? '5sim' : 'SMSPool'} order failed after retries`);
-}
-
-async function cancelSmsOrder(orderId, tag) {
-  try {
-    if (PROVIDER === '5sim') {
-      await fetchWithTimeout(`https://5sim.net/v1/user/cancel/${orderId}`, 15000, fivesimHeaders());
-    } else {
-      await fetchWithTimeout(`https://api.smspool.net/sms/cancel?key=${SMSPOOL_KEY}&orderid=${orderId}`);
-    }
-  } catch (err) {
-    console.error(`  [${tag}] Cancel order ${orderId} failed: ${err.message}`);
-  }
-}
-
-async function pollForCode(orderId, tag, attempts, previousCodes = []) {
-  const isFivesim = PROVIDER === '5sim';
-  for (let i = 0; i < attempts; i++) {
-    await new Promise(r => setTimeout(r, 3000));
-    try {
-      if (isFivesim) {
-        const data = await fetchWithTimeout(`https://5sim.net/v1/user/check/${orderId}`, 15000, fivesimHeaders());
-        if (data && Array.isArray(data.sms) && data.sms.length) {
-          const last = data.sms[data.sms.length - 1];
-          const code = last.code || (last.text || '').match(/(\d{4,6})/)?.[1] || '';
-          if (!code || previousCodes.includes(code)) continue;
-          console.log(`  [${tag}] SMS code: ${code}`);
-          return code;
-        }
-      } else {
-        const data = await fetchWithTimeout(`https://api.smspool.net/sms/check?key=${SMSPOOL_KEY}&orderid=${orderId}`);
-        if (data.status === 3 || data.sms) {
-          const fullSms = data.sms || data.full_sms || '';
-          const match = fullSms.match(/(\d{4,6})/);
-          const code = match ? match[1] : fullSms;
-          if (previousCodes.includes(code)) continue;
-          console.log(`  [${tag}] SMS code: ${code}`);
-          return code;
-        }
-      }
-    } catch {}
-  }
-  return null;
-}
-
-// ── Browser helpers ──
-
-async function killBrowser(browser, tag) {
-  if (!browser) return;
-  try {
-    await Promise.race([
-      browser.close(),
-      new Promise(r => setTimeout(r, 5000)),
-    ]);
-  } catch {}
-  try { browser.process()?.kill('SIGKILL'); } catch {}
-  console.log(`  [${tag}] Browser killed`);
-}
-
-async function launchBrowser(proxy, tag) {
-  let browser;
-  try {
-    browser = await chromium.launch({
-      headless: false,
-      channel: 'chrome',
-      args: ['--disable-blink-features=AutomationControlled', `--proxy-server=${proxy.server}`],
-    });
-    const contextOpts = {};
-    if (proxy.username) contextOpts.httpCredentials = { username: proxy.username, password: proxy.password };
-    const context = await browser.newContext(contextOpts);
-    const page = await context.newPage();
-    await page.addInitScript(() => { Object.defineProperty(navigator, 'webdriver', { get: () => false }); });
-    return { browser, page };
-  } catch (err) {
-    if (browser) await killBrowser(browser, tag);
-    throw new Error(`Browser launch failed: ${err.message}`);
-  }
-}
-
-// ── Step 1: Fill personal info and navigate to phone page ──
-
-async function step1_fillInfo(page, email, formUrl, firstNames, lastNames, postalCodes, tag) {
-  const firstName = randomFrom(firstNames);
-  const lastName = randomFrom(lastNames);
-  const postalCode = randomFrom(postalCodes);
-
-  console.log(`  [${tag}] ${firstName} ${lastName} | ${email} | ${postalCode}`);
-
-  await page.goto(formUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-  await page.waitForSelector('input', { timeout: 15000 });
-  await page.waitForTimeout(1500);
-
-  const inputs = await page.$$('input');
-  if (inputs.length < 4) throw new Error(`Expected 4 inputs, found ${inputs.length}`);
-
-  await inputs[0].fill(firstName);
-  await inputs[1].fill(lastName);
-  await inputs[2].fill(email);
-  await inputs[3].fill(postalCode);
-
-  await page.click('button[type="submit"]');
-
-  // Try to reach /phone, handle checkbox validation
-  try {
-    await page.waitForURL('**/phone', { timeout: 15000 });
-    return;
-  } catch {}
-
-  // Check what went wrong
-  const bodyText = await page.innerText('body').catch(() => '');
-
-  if (bodyText.includes('must confirm your age') || bodyText.includes('Not a valid')) {
-    console.log(`  [${tag}] Validation error, toggling checkboxes...`);
-    const pointers = await page.$$('div.pointer');
-    for (const p of pointers) {
-      const text = (await p.innerText()).trim();
-      if (text === '') { await p.click(); await page.waitForTimeout(200); }
-    }
-    await page.click('button[type="submit"]');
-    await page.waitForURL('**/phone', { timeout: 15000 });
-    return;
-  }
-
-  throw new Error(`Stuck on step 1: ${bodyText.substring(0, 150)}`);
-}
-
-// Returns true once the "Verify" button is enabled (Turnstile passed).
-// NOTE: the phone page also has an unrelated, always-enabled "Next" submit button,
-// so we must gate specifically on the Verify button's text — not just any
-// non-disabled submit, or we'd false-positive and skip solving Turnstile.
-async function submitEnabled(page) {
-  return page.evaluate(() => {
-    const btns = Array.from(document.querySelectorAll('button[type="submit"]'));
-    const verify = btns.filter(b => (b.innerText || '').trim().toLowerCase() === 'verify');
-    return verify.length > 0 && verify.some(b => !b.disabled);
-  }).catch(() => false);
-}
-
-// Cloudflare Turnstile renders as an interactive checkbox that must be clicked.
-// Its iframe is NESTED (the outer <iframe> has no src; the real challenge UI is
-// a child frame whose URL is on challenges.cloudflare.com) and the checkbox lives
-// in shadow DOM, so neither a `src`-based selector nor a checkbox selector works.
-// What does work: grab the cloudflare frame from the frame tree and click its body
-// near the top-left, where the checkbox sits. We poll until the submit button
-// enables (auto-mode passes on its own; interactive mode needs the click).
-async function solveTurnstile(page, tag, timeoutMs = 120000) {
-  console.log(`  [${tag}] Waiting for Turnstile...`);
-  const deadline = Date.now() + timeoutMs;
-  let lastClick = 0;
-  let clicks = 0;
-
-  while (Date.now() < deadline) {
-    if (await submitEnabled(page)) return;
-
-    // Click only once every ~8s. Turnstile takes a few seconds to verify after a
-    // click; clicking again mid-verification resets it, so it never completes.
-    // Between clicks we just poll for the button to enable.
-    if (Date.now() - lastClick > 8000) {
-      const cf = page.frames().find(f => f.url().includes('challenges.cloudflare.com'));
-      if (cf) {
-        try {
-          const cb = cf.locator('input[type="checkbox"]').first();
-          if (await cb.isVisible({ timeout: 1000 }).catch(() => false)) {
-            await cb.click({ timeout: 2000 });
-          } else {
-            await cf.locator('body').click({ position: { x: 30, y: 30 }, timeout: 2000 });
-          }
-          lastClick = Date.now();
-          clicks++;
-          console.log(`  [${tag}] Clicked Turnstile (attempt ${clicks})`);
-        } catch {}
-      }
-    }
-
-    await page.waitForTimeout(1000);
-  }
-
-  throw new Error('Turnstile not solved before timeout');
-}
-
-// ── Step 2: Enter phone, solve captcha, click verify ──
-
-async function step2_phone(page, phoneDigits, tag) {
-  const phoneInput = await page.waitForSelector('input[type="tel"]', { timeout: 15000 });
-  // All events are US, so the form already defaults to a US (+1) country code.
-  await phoneInput.fill('');
-  await phoneInput.fill(phoneDigits);
-
-  await solveTurnstile(page, tag);
-
-  // Click the Verify button specifically (not the unrelated, always-enabled "Next").
-  await page.locator('button[type="submit"]:has-text("Verify"):not([disabled])').first().click({ timeout: 10000 });
-  await page.waitForTimeout(3000);
-
-  // Check for "Issue validating number" error
-  const bodyText = await page.innerText('body').catch(() => '');
-  if (bodyText.includes('Issue validating')) {
-    throw new Error('Phone number rejected by Seated');
-  }
-
-}
-
-// ── Step 3: Enter SMS code and submit ──
-
-async function step3_enterCode(page, smsCode, tag) {
-  await page.waitForTimeout(2000);
-  const codeInputs = await page.$$('input');
-  const visibleInputs = [];
-  for (const inp of codeInputs) {
-    const type = await inp.getAttribute('type');
-    if (type !== 'hidden') visibleInputs.push(inp);
-  }
-
-  if (visibleInputs.length === 0) throw new Error('No code input found');
-
-  if (visibleInputs.length === 1) {
-    await visibleInputs[0].fill(smsCode);
-  } else {
-    for (let i = 0; i < Math.min(smsCode.length, visibleInputs.length); i++) {
-      await visibleInputs[i].fill(smsCode[i]);
+      await flow.sleep(this.stamps[0] + 60000 - now + 50);
     }
   }
-
-  try { await page.locator('button[type="submit"]').first().click({ timeout: 5000 }); } catch {}
-  await page.waitForTimeout(3000);
-
-  // Handle optional consent/preferences page that sometimes appears after SMS code
-  const prefsBody = await page.innerText('body').catch(() => '');
-  if (prefsBody.includes('Confirm your preferences') || prefsBody.includes('confirm your preferences')) {
-    console.log(`  [${tag}] Preferences page — checking age box...`);
-    const ageLocator = page.locator(':text("I confirm that I am 13")').first();
-    const ageVisible = await ageLocator.isVisible().catch(() => false);
-    if (ageVisible) {
-      await ageLocator.click();
-      await page.waitForTimeout(200);
-    } else {
-      const pointers = await page.$$('div.pointer');
-      if (pointers.length > 0) { await pointers[0].click(); await page.waitForTimeout(200); }
-    }
-    const confirmBtn = page.locator('button:text("Confirm")').first();
-    const confirmVisible = await confirmBtn.isVisible().catch(() => false);
-    if (confirmVisible) { await confirmBtn.click(); } else { await page.click('button[type="submit"]'); }
-    await page.waitForTimeout(1500);
-  }
-
-  // Handle optional quantity + price pages that can appear after SMS code.
-  // Defaults are already selected — just click "Next" on each.
-  for (let i = 0; i < 4; i++) {
-    const body = await page.innerText('body').catch(() => '');
-    const isQuantityPage = body.includes('How many tickets are you looking to buy');
-    const isPricePage = body.includes('How much are you willing to spend per ticket');
-    if (!isQuantityPage && !isPricePage) break;
-
-    const label = isQuantityPage ? 'Quantity' : 'Price';
-    console.log(`  [${tag}] ${label} page — clicking Next (default selected)...`);
-
-    const nextBtn = page.locator('button:has-text("Next")').first();
-    const nextVisible = await nextBtn.isVisible().catch(() => false);
-    if (nextVisible) { await nextBtn.click(); } else { await page.click('button[type="submit"]'); }
-    await page.waitForTimeout(1500);
-  }
 }
 
-// ── Process ONE email end-to-end, retrying up to MAX_ATTEMPTS times. ──
-// Every attempt gets a fresh proxy, a fresh SMS number, and a fresh browser,
-// so a bad proxy / dead number / crashed browser on one try doesn't doom the email.
-// Returns true on success, false only after all attempts are exhausted.
+function pickProvider(setting) {
+  if (setting === 'mix') return Math.random() < 0.5 ? '5sim' : 'smspool';
+  return setting;
+}
 
-async function processEmail(email, formUrl, completedFile, firstNames, lastNames, postalCodes, tag) {
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const aTag = `${tag} a${attempt}/${MAX_ATTEMPTS}`;
-    const proxy = loadProxy();
-    let browser = null;
-    let orderId = null;
+// Process one email: up to MAX_ATTEMPTS attempts. The SMS order (once created)
+// is reused across attempts until Verify is clicked - a failed proxy or
+// Turnstile never wastes a number. Only phone rejection / no-SMS burns it.
+async function processTask(task, ctx) {
+  const { browserMgr, proxyPool, data, args } = ctx;
+  const id = store.eventId(task.event.url);
+  let order = null;        // SMS order, reused across attempts
+  let verifyClicked = false;
+
+  for (let attempt = 1; attempt <= cfg.MAX_ATTEMPTS; attempt++) {
+    const tag = `${task.tag} a${attempt}/${cfg.MAX_ATTEMPTS}`;
+    let proxy = null;
+    let context = null;
+    const t0 = Date.now();
+    let turnstileMethod = null;
+    let verifyStatus = null;
 
     try {
-      const order = await orderSmsNumber(aTag);
-      orderId = order.orderId;
-      const phoneDigits = order.phone.toString().replace(/^\+?1/, '');
+      proxy = await proxyPool.acquire(id, tag);
+      console.log(`  [${tag}] proxy ${proxy.label} (${proxy.pool}${proxy.geo ? `, ${proxy.geo.city || proxy.geo.state || proxy.geo.country}` : ''})`);
 
-      const launched = await launchBrowser(proxy, aTag);
-      browser = launched.browser;
-      const page = launched.page;
+      context = await browserMgr.newContext(proxy);
+      const page = await context.newPage();
 
-      await withTimeout((async () => {
-        await step1_fillInfo(page, email, formUrl, firstNames, lastNames, postalCodes, aTag);
-        await step2_phone(page, phoneDigits, aTag);
-        const smsCode = await pollForCode(orderId, aTag, 20);
-        if (!smsCode) throw new Error('No SMS received');
-        await step3_enterCode(page, smsCode, aTag);
-      })(), ATTEMPT_TIMEOUT_MS, 'attempt');
+      // Step 1: info. (No SMS money spent yet.)
+      await flow.step1(page, task, data, proxy, tag);
 
-      markCompleted(completedFile, email);
-      console.log(`${GREEN}  [${aTag}] SUCCESS — ${email}${RESET}`);
+      // Order the number only now, and solve Turnstile before Verify so a
+      // Turnstile failure keeps the number usable for the next attempt.
+      if (!order) order = await sms.orderNumber(pickProvider(args.provider), tag);
+      const digits = sms.toUsDigits(order.phone);
+
+      const step2Result = await flow.step2(page, digits, tag);
+      turnstileMethod = step2Result.method;
+      verifyStatus = step2Result.verifyStatus;
+      verifyClicked = true;
+
+      const code = await sms.pollForCode(order, tag);
+      if (!code) throw new flow.FlowError('phone', 'no SMS received in time');
+
+      await flow.step3(page, code, tag);
+      const auditResult = await flow.audit(page, task, tag);
+
+      store.markCompleted(task.completedFile, task.email);
+      proxyPool.reportResult(proxy, true);
+      store.logRun({
+        event: id, email: task.email, attempt, result: 'success',
+        verified: auditResult.verified, proxy: proxy.label, pool: proxy.pool,
+        geo: proxy.geo || undefined, provider: order.provider, turnstile: turnstileMethod,
+        verifyStatus, ms: Date.now() - t0,
+      });
+      console.log(`${GREEN}  [${tag}] SUCCESS - ${task.email} (${Math.round((Date.now() - t0) / 1000)}s, turnstile: ${turnstileMethod})${RESET}`);
       return true;
     } catch (err) {
-      console.error(`${RED}  [${aTag}] attempt failed — ${email}: ${err.message}${RESET}`);
-      if (orderId) await cancelSmsOrder(orderId, aTag);
-      if (attempt < MAX_ATTEMPTS) {
-        console.log(`  [${aTag}] Retrying in 5s with fresh number + proxy...`);
-        await new Promise(r => setTimeout(r, 5000));
+      const kind = err.kind || (String(err.message).includes('net::ERR') ? 'proxy' : 'flow');
+      console.error(`${RED}  [${tag}] attempt failed (${kind}) - ${task.email}: ${String(err.message).slice(0, 150)}${RESET}`);
+      if (err.fatal) { task.fatal = err.message; throw err; }
+      if (kind === 'closed') { task.closed = true; return false; } // window shut - no point retrying
+
+      if (context) await flow.errorShot(await context.pages()[0] || null, task, `error-a${attempt}`).catch(() => {});
+      // Only blame the proxy for failures it plausibly caused (dead connection,
+      // Turnstile refusing the IP, backend rejecting the verify - Prelude and
+      // Seated both score the IP). Phone rejection / no-SMS is not its fault.
+      if (proxy && (kind === 'proxy' || kind === 'turnstile' || kind === 'verify')) proxyPool.reportResult(proxy, false);
+      store.logRun({
+        event: id, email: task.email, attempt, result: 'fail', kind,
+        error: String(err.message).slice(0, 200), proxy: proxy && proxy.label,
+        pool: proxy && proxy.pool, provider: order && order.provider,
+        turnstile: turnstileMethod, verifyStatus, ms: Date.now() - t0,
+      });
+
+      // Burn the number once Verify has been clicked in ANY attempt: the SMS
+      // may already be in flight to this session, so reusing it is unsafe.
+      if (order && verifyClicked) {
+        await sms.cancelOrder(order, tag);
+        order = null;
+        verifyClicked = false;
+      }
+
+      if (attempt < cfg.MAX_ATTEMPTS) {
+        const wait = flow.rand(4000, 9000);
+        console.log(`  [${tag}] retrying in ${Math.round(wait / 1000)}s (fresh context + proxy${order ? ', same number' : ''})...`);
+        await flow.sleep(wait);
       }
     } finally {
-      await killBrowser(browser, aTag);
+      if (proxy) proxyPool.release(proxy);
+      await browserMgr.closeContext(context, tag);
     }
   }
 
-  console.error(`${RED}  [${tag}] GAVE UP after ${MAX_ATTEMPTS} attempts — ${email}${RESET}`);
+  if (order) await sms.cancelOrder(order, task.tag);
+  console.error(`${RED}  [${task.tag}] GAVE UP after ${cfg.MAX_ATTEMPTS} attempts - ${task.email}${RESET}`);
   return false;
 }
 
-// ── Single global pool: keep CONCURRENCY emails in flight across ALL events. ──
-// As soon as one email finishes (success or final failure), the next pending
-// email from any event launches — the pool never drains between events.
+async function main() {
+  const args = parseArgs(process.argv);
+  const { tasks, uniqueCount, totalAssigned, totalDone, leftover } = store.buildTasks();
+  const data = store.loadIdentityData();
 
-function runGlobalPool(tasks, firstNames, lastNames, postalCodes) {
-  return new Promise((resolve) => {
-    let succeeded = 0;
-    let failed = 0;
-    let nextIdx = 0;
-    const active = new Map();
+  const proxyPool = new ProxyPool();
+  const pools = proxyPool.load();
+  const pSummary = proxyPool.summary();
 
-    function launch() {
-      if (nextIdx >= tasks.length) return;
-      const idx = nextIdx++;
-      const t = tasks[idx];
-      const tag = `${idx + 1}/${tasks.length} ${t.eventShort}`;
-      const entry = { tag, task: t, startTime: Date.now(), done: false, ok: false };
-      active.set(idx, entry);
+  console.log(`Emails: ${uniqueCount} unique | assigned ${totalAssigned} | done ${totalDone} | pending ${tasks.length}`);
+  if (leftover > 0) console.log(`${YELLOW}  Note: ${leftover} extra email(s) beyond the planned total are unassigned.${RESET}`);
+  console.log(`Proxies: ${Object.entries(pools).map(([k, v]) => `${v} ${k}`).join(' + ')} | ${pSummary.quarantined} quarantined | ${pSummary.geoCached} geo-cached`);
+  console.log(`Plan: ${args.workers} workers | ${args.rpm} starts/min | provider ${args.provider} | ${args.headed ? 'HEADED' : 'headless'} | ${cfg.MAX_ATTEMPTS} attempts/email`);
 
-      console.log(`  >> Launched [${tag}] ${t.email} — ${active.size} active`);
-
-      processEmail(t.email, t.event.url, t.completedFile, firstNames, lastNames, postalCodes, tag)
-        .then((ok) => { entry.ok = ok; })
-        .catch(() => { entry.ok = false; })
-        .finally(() => { entry.done = true; });
-    }
-
-    const interval = setInterval(() => {
-      const now = Date.now();
-
-      // Reap finished + drop timed-out (backstop; processEmail self-bounds per attempt)
-      for (const [idx, entry] of active) {
-        if (entry.done) {
-          if (entry.ok) succeeded++; else failed++;
-          active.delete(idx);
-        } else if (now - entry.startTime > TASK_TIMEOUT_MS) {
-          console.log(`  [${entry.tag}] HARD KILL (timeout) — ${entry.task.email}`);
-          failed++;
-          active.delete(idx);
-        }
-      }
-
-      // Top up to CONCURRENCY from the single global queue
-      while (active.size < CONCURRENCY && nextIdx < tasks.length) launch();
-
-      console.log(`  [POOL] ${active.size} active | ${GREEN}${succeeded} ok${RESET} | ${RED}${failed} fail${RESET} | ${tasks.length - nextIdx} queued`);
-
-      if (active.size === 0 && nextIdx >= tasks.length) {
-        clearInterval(interval);
-        resolve({ succeeded, failed });
-      }
-    }, 2000);
-
-    // Initial fill
-    while (active.size < CONCURRENCY && nextIdx < tasks.length) launch();
-  });
-}
-
-// ── MAIN: split emails across events, flatten into one global queue, run pool ──
-
-(async () => {
-  const provAnswer = await askQuestion('SMS provider? 1 = SMSPool, 2 = 5sim (default 1): ');
-  PROVIDER = provAnswer.trim() === '2' ? '5sim' : 'smspool';
-  console.log(`Using SMS provider: ${PROVIDER}`);
-
-  const answer = await askQuestion('How many concurrent windows? (default 10): ');
-  CONCURRENCY = parseInt(answer, 10) || 10;
-
-  const allEmails = loadLines('emails.txt').filter(l => l.includes('@'));
-  const uniqueEmails = [...new Set(allEmails)];
-
-  // Slice the email list sequentially across events (first N → event 1, etc.).
-  // Deterministic on emails.txt order, so reruns assign the same emails to the same events.
-  const assignments = [];
-  let cursor = 0;
-  for (const event of EVENTS) {
-    const slice = uniqueEmails.slice(cursor, cursor + event.count);
-    cursor += event.count;
-    assignments.push({ event, emails: slice });
+  if (!data.firstNames.length || !data.lastNames.length || !data.postalCodes.length) {
+    console.error(`${RED}firstNames.txt / lastNames.txt / postalCodes.txt missing or empty${RESET}`);
+    process.exit(1);
   }
-  const leftover = uniqueEmails.length - cursor;
-
-  const firstNames = loadLines('firstNames.txt');
-  const lastNames = loadLines('lastNames.txt');
-  const postalCodes = loadLines('postalCodes.txt');
-
-  // Build ONE global task list across all events, skipping already-completed emails.
-  const tasks = [];
-  let totalAssigned = 0;
-  let totalDone = 0;
-  for (const { event, emails } of assignments) {
-    const completedFile = completedFileFor(event.url);
-    const completed = loadCompleted(completedFile);
-    totalAssigned += emails.length;
-    for (const email of emails) {
-      if (completed.has(email)) { totalDone++; continue; }
-      tasks.push({ email, event, completedFile, eventShort: event.name });
-    }
-  }
-
-  console.log(`Loaded ${uniqueEmails.length} unique emails across ${EVENTS.length} events.`);
-  if (leftover > 0) console.log(`${RED}  Note: ${leftover} extra email(s) beyond the planned total are unassigned.${RESET}`);
-  console.log(`Assigned: ${totalAssigned} | Already done: ${totalDone} | Pending: ${tasks.length}`);
-  console.log(`Global pool: ${CONCURRENCY} concurrent | up to ${MAX_ATTEMPTS} attempts/email | fresh number+proxy per attempt\n`);
-
-  if (!tasks.length) {
-    console.log('Nothing pending across any event — done.');
+  if (!tasks.length) { console.log('Nothing pending - done.'); process.exit(0); }
+  if (args.dryRun) {
+    for (const t of tasks.slice(0, 30)) console.log(`  ${t.email} -> event ${t.eventShort}`);
+    if (tasks.length > 30) console.log(`  ... and ${tasks.length - 30} more`);
     process.exit(0);
   }
 
-  const { succeeded, failed } = await runGlobalPool(tasks, firstNames, lastNames, postalCodes);
+  const browserMgr = new BrowserManager({ headed: args.headed });
 
-  console.log(`\n=== ALL DONE === ${GREEN}${succeeded} ok${RESET}, ${RED}${failed} fail${RESET}`);
-  console.log(`  Per-event progress is in completed-<eventId>.txt files.`);
-  process.exit(0);
-})();
+  // Pre-flight: probe each event once so we never burn SMS orders on a closed
+  // signup window. Events whose probe fails inconclusively are kept (don't
+  // block the run on a flaky probe).
+  const openEvents = new Set();
+  for (const event of cfg.EVENTS) {
+    const probe = await flow.probeEvent(browserMgr, proxyPool, event, 'PROBE');
+    if (probe.open === true) {
+      console.log(`${GREEN}  [PROBE] event ${event.name}: open - ${probe.detail}${RESET}`);
+      openEvents.add(event.url);
+    } else if (probe.open === false) {
+      console.log(`${YELLOW}  [PROBE] event ${event.name}: NO OPEN FORM - ${probe.detail} (its tasks will be skipped)${RESET}`);
+    } else {
+      console.log(`${YELLOW}  [PROBE] event ${event.name}: inconclusive - ${probe.detail} (keeping its tasks)${RESET}`);
+      openEvents.add(event.url);
+    }
+  }
+  const queueAll = tasks.filter(t => openEvents.has(t.event.url));
+  if (!queueAll.length) {
+    console.log(`${RED}No tasks for open events - nothing to do.${RESET}`);
+    await browserMgr.shutdown();
+    process.exit(0);
+  }
+  if (queueAll.length < tasks.length) {
+    console.log(`${YELLOW}${tasks.length - queueAll.length} task(s) skipped (closed events).${RESET}`);
+  }
+
+  const queue = queueAll.slice(0, args.limit > 0 ? args.limit : queueAll.length);
+  if (args.limit > 0 && queueAll.length > args.limit) {
+    console.log(`${YELLOW}--limit ${args.limit}: processing ${queue.length} of ${queueAll.length} pending${RESET}`);
+  }
+  queue.forEach((t, i) => { t.tag = `${i + 1}/${queue.length} ev${t.eventShort}`; });
+  const limiter = new RateLimiter(args.rpm);
+  let nextIdx = 0;
+  let succeeded = 0;
+  let failed = 0;
+  let stopping = false;
+  let fatalError = null;
+  const inFlight = new Set();
+
+  const worker = async (w) => {
+    await flow.sleep(w * 3000); // stagger worker starts
+    while (!stopping && nextIdx < queue.length) {
+      const task = queue[nextIdx++];
+      await limiter.wait();
+      if (stopping) { nextIdx--; break; } // put it back
+      console.log(`  >> [${task.tag}] start ${task.email} (${queue.length - nextIdx} queued)`);
+      const p = processTask(task, { browserMgr, proxyPool, data, args })
+        .then(ok => { ok ? succeeded++ : failed++; })
+        .catch(err => {
+          if (err && err.fatal) { fatalError = err; stopping = true; }
+          else failed++;
+        })
+        .finally(() => inFlight.delete(p));
+      inFlight.add(p);
+      await p;
+    }
+  };
+
+  // Ctrl-C: first = stop pulling new tasks, second = force quit.
+  let presses = 0;
+  process.on('SIGINT', () => {
+    presses++;
+    if (presses === 1) {
+      stopping = true;
+      console.log(`\n${YELLOW}[Ctrl-C] finishing ${inFlight.size} in-flight task(s), then stopping (Ctrl-C again to quit NOW)${RESET}`);
+      setTimeout(() => { console.log('force exit'); process.exit(1); }, 20000).unref();
+    } else {
+      process.exit(1);
+    }
+  });
+
+  await Promise.all(Array.from({ length: args.workers }, (_, i) => worker(i)));
+  await browserMgr.shutdown();
+
+  console.log(`\n=== DONE === ${GREEN}${succeeded} ok${RESET} | ${RED}${failed} fail${RESET} | ${queue.length - nextIdx} not started`);
+  if (fatalError) console.log(`${RED}Stopped early (fatal): ${fatalError.message} - unstarted emails remain pending for next run.${RESET}`);
+  console.log(`  Per-event progress: completed-<eventId>.txt | audits: out/ | run log: out/run-log.jsonl`);
+  process.exit(fatalError ? 1 : 0);
+}
+
+main().catch(err => {
+  console.error(`${RED}Fatal: ${err.stack || err.message}${RESET}`);
+  process.exit(1);
+});

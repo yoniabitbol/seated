@@ -2,3 +2,7 @@ node_modules/
 completed*
 .DS_Store
 emails.txt
+.env
+out/
+proxy-stats.json
+residential.txt

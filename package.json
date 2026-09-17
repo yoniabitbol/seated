@@ -1,16 +1,16 @@
 {
   "name": "seated",
-  "version": "1.0.0",
-  "main": "index.js",
+  "version": "2.0.0",
+  "main": "fill-form.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node fill-form.js",
+    "dry": "node fill-form.js --dry-run"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "description": "",
   "dependencies": {
-    "@prelude.so/js-sdk": "^0.9.0",
     "playwright": "^1.60.0"
   }
 }
