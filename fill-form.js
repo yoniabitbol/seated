@@ -63,7 +63,8 @@ class RateLimiter {
   }
 }
 
-function pickProvider(setting) {
+function pickProvider(setting, task) {
+  if (task && task.areaCode) return 'smspool'; // only SMSPool supports area codes
   if (setting === 'mix') return Math.random() < 0.5 ? '5sim' : 'smspool';
   return setting;
 }
@@ -76,6 +77,10 @@ async function processTask(task, ctx) {
   const id = store.eventId(task.event.url);
   let order = null;        // SMS order, reused across attempts
   let verifyClicked = false;
+  // Area code for this task (from the event config): fixed for the whole task
+  // so the postal code typed in step 1 matches the number ordered later.
+  const eventAreaCodes = sms.normalizeAreaCodes(task.event.areaCodes);
+  task.areaCode = eventAreaCodes.length ? eventAreaCodes[Math.floor(Math.random() * eventAreaCodes.length)] : null;
 
   for (let attempt = 1; attempt <= cfg.MAX_ATTEMPTS; attempt++) {
     const tag = `${task.tag} a${attempt}/${cfg.MAX_ATTEMPTS}`;
@@ -97,7 +102,11 @@ async function processTask(task, ctx) {
 
       // Order the number only now, and solve Turnstile before Verify so a
       // Turnstile failure keeps the number usable for the next attempt.
-      if (!order) order = await sms.orderNumber(pickProvider(args.provider), tag);
+      if (!order) {
+        order = await sms.orderNumber(pickProvider(args.provider, task), tag, 3, {
+          areaCode: task.areaCode, fallbackAreaCodes: eventAreaCodes,
+        });
+      }
       const digits = sms.toUsDigits(order.phone);
 
       const step2Result = await flow.step2(page, digits, tag);
@@ -116,8 +125,8 @@ async function processTask(task, ctx) {
       store.logRun({
         event: id, email: task.email, attempt, result: 'success',
         verified: auditResult.verified, proxy: proxy.label, pool: proxy.pool,
-        geo: proxy.geo || undefined, provider: order.provider, turnstile: turnstileMethod,
-        verifyStatus, ms: Date.now() - t0,
+        geo: proxy.geo || undefined, provider: order.provider, areaCode: order.areaCode || undefined,
+        turnstile: turnstileMethod, verifyStatus, ms: Date.now() - t0,
       });
       console.log(`${GREEN}  [${tag}] SUCCESS - ${task.email} (${Math.round((Date.now() - t0) / 1000)}s, turnstile: ${turnstileMethod})${RESET}`);
       return true;
@@ -181,11 +190,28 @@ async function main() {
     console.error(`${RED}firstNames.txt / lastNames.txt / postalCodes.txt missing or empty${RESET}`);
     process.exit(1);
   }
+  for (const event of cfg.EVENTS) {
+    const codes = sms.normalizeAreaCodes(event.areaCodes);
+    if (codes.length) console.log(`Event ${event.name}: area codes ${codes.join(', ')} (SMSPool pool ${cfg.SMSPOOL_AREA_POOL})`);
+  }
   if (!tasks.length) { console.log('Nothing pending - done.'); process.exit(0); }
   if (args.dryRun) {
     for (const t of tasks.slice(0, 30)) console.log(`  ${t.email} -> event ${t.eventShort}`);
     if (tasks.length > 30) console.log(`  ... and ${tasks.length - 30} more`);
     process.exit(0);
+  }
+
+  // Pre-flight: warn about pinned area codes SMSPool has no stock for right now
+  // (read-only lookup; a failed lookup is not fatal).
+  const wantedCodes = [...new Set(cfg.EVENTS.flatMap(e => sms.normalizeAreaCodes(e.areaCodes)))];
+  if (wantedCodes.length) {
+    const inStock = await sms.availableAreaCodes();
+    if (!inStock) console.log(`${YELLOW}  [PROBE] could not fetch SMSPool area-code stock, continuing${RESET}`);
+    else {
+      const missing = wantedCodes.filter(c => !inStock.includes(c));
+      if (missing.length) console.log(`${YELLOW}  [PROBE] area codes with no SMSPool stock right now: ${missing.join(', ')} (orders will retry/widen)${RESET}`);
+      else console.log(`${GREEN}  [PROBE] all ${wantedCodes.length} pinned area code(s) in SMSPool stock${RESET}`);
+    }
   }
 
   const browserMgr = new BrowserManager({ headed: args.headed });
